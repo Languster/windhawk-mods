@@ -1,21 +1,25 @@
 // ==WindhawkMod==
 // @id              explorer-navigation-pane-tweaks
-// @name            Explorer Navigation Pane Tweaks
-// @description     Adjusts the navigation pane tree indent and treeview visual styles in Windows Explorer
+// @name            Explorer Navigation Tree Offset
+// @description     Adjusts the Explorer navigation tree offset and optional tree view visual styles
 // @version         1.1
 // @author          Languster
 // @github          https://github.com/Languster
 // @include         explorer.exe
 // @architecture    x86-64
-// @compilerOptions -lcomctl32
+// @compilerOptions -lcomctl32 -luxtheme
 // @license         MIT
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
 /*
-# Explorer Navigation Pane Tweaks
+# Explorer Navigation Tree Offset
 
 Adjusts the horizontal position and visual tree style of the navigation pane in Windows Explorer.
+
+> Recommended: use this mod together with [Explorer TreeItem Tweaker](https://windhawk.net/mods/explorer-treeitem-tweaker) and [Explorer TreeLine Killer](https://windhawk.net/mods/explorer-treeline-killer) for the best navigation tree appearance.
+
+It is recommended to open a new Explorer window after enabling or updating this mod for the best results.
 
 ## Before / After
 
@@ -23,7 +27,7 @@ Adjusts the horizontal position and visual tree style of the navigation pane in 
 
 ![Before](https://raw.githubusercontent.com/Languster/ExplorerNavHook/main/screenshots/before.jpg)
 
-### With Explorer Navigation Pane Tweaks
+### With Explorer Navigation Tree Offset
 
 ![After](https://raw.githubusercontent.com/Languster/ExplorerNavHook/main/screenshots/after.jpg)
 
@@ -34,6 +38,7 @@ Adjusts the horizontal position and visual tree style of the navigation pane in 
 - can remove all expand/collapse glyphs
 - can remove only the first/root expand glyph while keeping child glyphs
 - can remove connector lines
+- item background position compensation
 
 ## Settings
 
@@ -41,6 +46,7 @@ Adjusts the horizontal position and visual tree style of the navigation pane in 
 - **Remove all expand/collapse glyphs**: removes the tree expand/collapse glyphs in the navigation pane.
 - **Remove first expand glyph**: removes only the first/root expand/collapse glyph while keeping child glyphs. Works when **Remove all expand/collapse glyphs** is disabled.
 - **Remove connector lines**: removes the tree connector lines in the navigation pane.
+- **Compensate item background position**: when the tree is shifted, the hover/selected item background shifts with it. This option moves the background back into place.
 
 ## Notes
 
@@ -67,11 +73,16 @@ The live-layout correction is done after Explorer positions the tree, without ho
 - RemoveHasLines: true
   $name: Remove connector lines
   $description: Removes the tree connector lines in the navigation pane
+
+- CompensateItemBackgroundPosition: true
+  $name: Compensate item background position
+  $description: When the tree is shifted, the hover/selected item background shifts with it. This option moves the background back into place.
 */
 // ==/WindhawkModSettings==
 
 #include <windows.h>
 #include <commctrl.h>
+#include <uxtheme.h>
 #include <vector>
 
 struct ExplorerState
@@ -111,6 +122,7 @@ static int g_TargetIndent = 25;
 static BOOL g_RemoveHasButtons = TRUE;
 static BOOL g_RemoveHasLines = TRUE;
 static BOOL g_RemoveLinesAtRoot = TRUE;
+static BOOL g_CompensateItemBackgroundPosition = TRUE;
 
 static CRITICAL_SECTION g_StateLock;
 static bool g_StateLockInitialized = false;
@@ -128,6 +140,7 @@ static void PatchTree(HWND hExplorer, HWND hTree);
 static void AdjustTreeWindowPosChanging(HWND hTree, WINDOWPOS* wp);
 static void RemoveAllSubclasses();
 static void WaitForRepatchThreadsToFinish();
+static bool ShouldCompensateTreeItemBackground(int partId, LPCRECT pRect);
 
 #define TREE_SUBCLASS_ID 0x4E505431u
 #define EXPLORER_SUBCLASS_ID 0x4E505432u
@@ -139,6 +152,15 @@ static HANDLE g_hNoRepatchThreadsEvent = nullptr;
 static HWND (WINAPI* CreateWindowExW_Original)(
     DWORD, LPCWSTR, LPCWSTR, DWORD, int, int, int, int,
     HWND, HMENU, HINSTANCE, LPVOID) = nullptr;
+
+static HRESULT (WINAPI* DrawThemeBackground_Original)(
+    HTHEME, HDC, int, int, LPCRECT, LPCRECT) = nullptr;
+
+static HRESULT (WINAPI* DrawThemeBackgroundEx_Original)(
+    HTHEME, HDC, int, int, LPCRECT, const DTBGOPTS*) = nullptr;
+
+static thread_local HWND g_CurrentPaintingTree = nullptr;
+static thread_local int g_CurrentPaintingTreeDepth = 0;
 
 static int AbsInt(int value)
 {
@@ -203,8 +225,9 @@ static void LoadSettings()
     g_RemoveHasButtons = Wh_GetIntSetting(L"RemoveHasButtons");
     g_RemoveHasLines = Wh_GetIntSetting(L"RemoveHasLines");
     g_RemoveLinesAtRoot = Wh_GetIntSetting(L"RemoveLinesAtRoot");
+    g_CompensateItemBackgroundPosition = Wh_GetIntSetting(L"CompensateItemBackgroundPosition");
 
-    Wh_Log(L"Settings loaded, treeLeftShift=%d", g_TargetIndent);
+    Wh_Log(L"Settings loaded, treeLeftShift=%d, compensateItemBackground=%d", g_TargetIndent, g_CompensateItemBackgroundPosition);
 }
 
 static bool IsExplorerTopWindow(HWND hwnd)
@@ -368,6 +391,192 @@ public:
 };
 
 
+class ScopedTreePaintContext
+{
+public:
+    explicit ScopedTreePaintContext(HWND hTree)
+    {
+        m_previousTree = g_CurrentPaintingTree;
+        g_CurrentPaintingTree = hTree;
+        ++g_CurrentPaintingTreeDepth;
+    }
+
+    ~ScopedTreePaintContext()
+    {
+        if (g_CurrentPaintingTreeDepth > 0)
+            --g_CurrentPaintingTreeDepth;
+
+        g_CurrentPaintingTree = m_previousTree;
+
+        if (g_CurrentPaintingTreeDepth <= 0)
+        {
+            g_CurrentPaintingTreeDepth = 0;
+            g_CurrentPaintingTree = nullptr;
+        }
+    }
+
+private:
+    HWND m_previousTree = nullptr;
+};
+
+#ifndef TVP_TREEITEM
+#define TVP_TREEITEM 1
+#endif
+
+static bool ShouldCompensateTreeItemBackground(int partId, LPCRECT pRect)
+{
+    if (!g_CompensateItemBackgroundPosition || g_Uninitializing || g_TargetIndent == 0)
+        return false;
+
+    if (g_CurrentPaintingTreeDepth <= 0 || !IsWindow(g_CurrentPaintingTree))
+        return false;
+
+    if (partId != TVP_TREEITEM)
+        return false;
+
+    if (!pRect)
+        return false;
+
+    int rectWidth = RectWidth(*pRect);
+    int rectHeight = RectHeight(*pRect);
+    if (rectWidth <= 0 || rectHeight <= 0)
+        return false;
+
+    if (!IsLikelyNavTree(g_CurrentPaintingTree))
+        return false;
+
+    if (rectHeight < 8 || rectHeight > 80)
+        return false;
+
+    // DrawThemeBackground is also used by the themed scrollbar hosted by the
+    // TreeView. Scrollbar arrow buttons can use the same numeric part id as
+    // TVP_TREEITEM. The previous protection filtered out all narrow rectangles,
+    // but short tree items such as "Videos" also have narrow background rects.
+    // Exclude only rectangles that are actually inside the vertical scrollbar
+    // strip at the right edge of the TreeView.
+    RECT clientRect{};
+    if (GetClientRect(g_CurrentPaintingTree, &clientRect))
+    {
+        int clientWidth = RectWidth(clientRect);
+        int clientHeight = RectHeight(clientRect);
+        int scrollbarWidth = GetSystemMetrics(SM_CXVSCROLL);
+        int scrollbarHeight = GetSystemMetrics(SM_CYVSCROLL);
+
+        int scrollbarLeft = clientWidth - scrollbarWidth - 4;
+        if (scrollbarLeft < 0)
+            scrollbarLeft = 0;
+
+        bool inVerticalScrollbarStrip =
+            pRect->left >= scrollbarLeft &&
+            pRect->right <= clientWidth + 4;
+
+        bool looksLikeScrollbarButton =
+            rectWidth <= scrollbarWidth + 8 &&
+            rectHeight <= scrollbarHeight + 8 &&
+            (pRect->top <= 4 || pRect->bottom >= clientHeight - 4);
+
+        if (inVerticalScrollbarStrip && looksLikeScrollbarButton)
+            return false;
+    }
+
+    int maxExpectedLeft = g_TargetIndent + 16;
+    if (maxExpectedLeft < 32)
+        maxExpectedLeft = 32;
+
+    if (pRect->left > maxExpectedLeft)
+        return false;
+
+    return true;
+}
+
+static HRESULT WINAPI DrawThemeBackground_Hook(
+    HTHEME hTheme,
+    HDC hdc,
+    int iPartId,
+    int iStateId,
+    LPCRECT pRect,
+    LPCRECT pClipRect)
+{
+    if (ShouldCompensateTreeItemBackground(iPartId, pRect))
+    {
+        RECT adjustedRect = *pRect;
+
+        // The shifted tree is wider by g_TargetIndent pixels: its left edge moves
+        // left, while the right edge stays aligned with Explorer's layout. Moving
+        // the whole background rect to the right fixes the left edge, but pushes
+        // the right edge too far. Only trim the left side instead.
+        adjustedRect.left += g_TargetIndent;
+        if (adjustedRect.left > adjustedRect.right)
+            adjustedRect.left = adjustedRect.right;
+
+        RECT adjustedClipRect{};
+        LPCRECT finalClipRect = pClipRect;
+        if (pClipRect)
+        {
+            adjustedClipRect = *pClipRect;
+            adjustedClipRect.left += g_TargetIndent;
+            if (adjustedClipRect.left > adjustedClipRect.right)
+                adjustedClipRect.left = adjustedClipRect.right;
+            finalClipRect = &adjustedClipRect;
+        }
+
+        return DrawThemeBackground_Original(
+            hTheme,
+            hdc,
+            iPartId,
+            iStateId,
+            &adjustedRect,
+            finalClipRect);
+    }
+
+    return DrawThemeBackground_Original(hTheme, hdc, iPartId, iStateId, pRect, pClipRect);
+}
+
+static HRESULT WINAPI DrawThemeBackgroundEx_Hook(
+    HTHEME hTheme,
+    HDC hdc,
+    int iPartId,
+    int iStateId,
+    LPCRECT pRect,
+    const DTBGOPTS* pOptions)
+{
+    if (ShouldCompensateTreeItemBackground(iPartId, pRect))
+    {
+        RECT adjustedRect = *pRect;
+
+        // Keep the right edge unchanged and compensate only the left edge.
+        // This prevents the background from stretching toward the content area.
+        adjustedRect.left += g_TargetIndent;
+        if (adjustedRect.left > adjustedRect.right)
+            adjustedRect.left = adjustedRect.right;
+
+        DTBGOPTS adjustedOptions{};
+        const DTBGOPTS* finalOptions = pOptions;
+        if (pOptions)
+        {
+            adjustedOptions = *pOptions;
+            if (adjustedOptions.dwFlags & DTBG_CLIPRECT)
+            {
+                adjustedOptions.rcClip.left += g_TargetIndent;
+                if (adjustedOptions.rcClip.left > adjustedOptions.rcClip.right)
+                    adjustedOptions.rcClip.left = adjustedOptions.rcClip.right;
+            }
+            finalOptions = &adjustedOptions;
+        }
+
+        return DrawThemeBackgroundEx_Original(
+            hTheme,
+            hdc,
+            iPartId,
+            iStateId,
+            &adjustedRect,
+            finalOptions);
+    }
+
+    return DrawThemeBackgroundEx_Original(hTheme, hdc, iPartId, iStateId, pRect, pOptions);
+}
+
+
 static void AdjustTreeWindowPosChanging(HWND hTree, WINDOWPOS* wp)
 {
     if (!wp || g_Uninitializing || g_InternalWindowPosDepth > 0)
@@ -503,7 +712,16 @@ static LRESULT CALLBACK TreeSubclassProc(
         AdjustTreeWindowPosChanging(hwnd, (WINDOWPOS*)lParam);
     }
 
-    LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
+    LRESULT result = 0;
+    if (msg == WM_PAINT || msg == WM_PRINTCLIENT)
+    {
+        ScopedTreePaintContext paintContext(hwnd);
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+    }
+    else
+    {
+        result = DefSubclassProc(hwnd, msg, wParam, lParam);
+    }
 
     if (g_Uninitializing || g_InternalWindowPosDepth > 0)
         return result;
@@ -1166,6 +1384,12 @@ BOOL Wh_ModInit()
 
     if (!Wh_SetFunctionHook((void*)CreateWindowExW, (void*)CreateWindowExW_Hook, (void**)&CreateWindowExW_Original))
         Wh_Log(L"Failed to hook CreateWindowExW");
+
+    if (!Wh_SetFunctionHook((void*)DrawThemeBackground, (void*)DrawThemeBackground_Hook, (void**)&DrawThemeBackground_Original))
+        Wh_Log(L"Failed to hook DrawThemeBackground");
+
+    if (!Wh_SetFunctionHook((void*)DrawThemeBackgroundEx, (void*)DrawThemeBackgroundEx_Hook, (void**)&DrawThemeBackgroundEx_Original))
+        Wh_Log(L"Failed to hook DrawThemeBackgroundEx");
 
     g_hWorkerThread = CreateThread(
         nullptr,
