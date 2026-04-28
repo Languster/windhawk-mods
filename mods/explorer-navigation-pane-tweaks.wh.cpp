@@ -19,8 +19,6 @@ Adjusts the horizontal position and visual tree style of the navigation pane in 
 
 > Recommended: use this mod together with [Explorer TreeItem Tweaker](https://windhawk.net/mods/explorer-treeitem-tweaker) and [Explorer TreeLine Killer](https://windhawk.net/mods/explorer-treeline-killer) for the best navigation tree appearance.
 
-It is recommended to open a new Explorer window after enabling or updating this mod for the best results.
-
 ## Before / After
 
 ### Default Explorer
@@ -83,6 +81,7 @@ The live-layout correction is done after Explorer positions the tree, without ho
 #include <windows.h>
 #include <commctrl.h>
 #include <uxtheme.h>
+#include <windhawk_utils.h>
 #include <vector>
 
 struct ExplorerState
@@ -697,13 +696,12 @@ static LRESULT CALLBACK TreeSubclassProc(
     UINT msg,
     WPARAM wParam,
     LPARAM lParam,
-    UINT_PTR,
     DWORD_PTR)
 {
     if (msg == WM_NCDESTROY)
     {
         LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
-        RemoveWindowSubclass(hwnd, TreeSubclassProc, TREE_SUBCLASS_ID);
+        WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, TreeSubclassProc);
         return result;
     }
 
@@ -743,14 +741,13 @@ static LRESULT CALLBACK ExplorerSubclassProc(
     UINT msg,
     WPARAM wParam,
     LPARAM lParam,
-    UINT_PTR,
     DWORD_PTR)
 {
     LRESULT result = DefSubclassProc(hwnd, msg, wParam, lParam);
 
     if (msg == WM_NCDESTROY)
     {
-        RemoveWindowSubclass(hwnd, ExplorerSubclassProc, EXPLORER_SUBCLASS_ID);
+        WindhawkUtils::RemoveWindowSubclassFromAnyThread(hwnd, ExplorerSubclassProc);
         return result;
     }
 
@@ -772,7 +769,7 @@ static void TrySubclassTree(HWND hTree)
     if (!IsWindow(hTree))
         return;
 
-    SetWindowSubclass(hTree, TreeSubclassProc, TREE_SUBCLASS_ID, 0);
+    WindhawkUtils::SetWindowSubclassFromAnyThread(hTree, TreeSubclassProc, 0);
 }
 
 static void TrySubclassExplorer(HWND hExplorer)
@@ -780,7 +777,7 @@ static void TrySubclassExplorer(HWND hExplorer)
     if (!IsWindow(hExplorer))
         return;
 
-    SetWindowSubclass(hExplorer, ExplorerSubclassProc, EXPLORER_SUBCLASS_ID, 0);
+    WindhawkUtils::SetWindowSubclassFromAnyThread(hExplorer, ExplorerSubclassProc, 0);
 }
 
 static void CaptureAndApplyTreeStyle(HWND hExplorer, HWND hTree)
@@ -981,6 +978,9 @@ static void PatchExplorerWindow(HWND hExplorer)
     if (!hTree)
         return;
 
+    TrySubclassExplorer(hExplorer);
+    TrySubclassTree(hTree);
+
     if (g_StateLockInitialized)
     {
         EnterCriticalSection(&g_StateLock);
@@ -1040,13 +1040,13 @@ static void RemoveAllSubclasses()
     for (HWND hTree : trees)
     {
         if (IsWindow(hTree))
-            RemoveWindowSubclass(hTree, TreeSubclassProc, TREE_SUBCLASS_ID);
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hTree, TreeSubclassProc);
     }
 
     for (HWND hExplorer : explorers)
     {
         if (IsWindow(hExplorer))
-            RemoveWindowSubclass(hExplorer, ExplorerSubclassProc, EXPLORER_SUBCLASS_ID);
+            WindhawkUtils::RemoveWindowSubclassFromAnyThread(hExplorer, ExplorerSubclassProc);
     }
 }
 
@@ -1455,13 +1455,8 @@ void Wh_ModUninit()
     g_TreeStates.clear();
 }
 
-BOOL Wh_ModSettingsChanged(BOOL* bReload)
+void Wh_ModSettingsChanged()
 {
-    if (bReload)
-        *bReload = FALSE;
-
     LoadSettings();
     InitialPatchAllExplorerWindows();
-
-    return TRUE;
 }
