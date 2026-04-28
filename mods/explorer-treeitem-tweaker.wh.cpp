@@ -1117,18 +1117,20 @@ static bool HookExplorerFrameSymbols()
     }
 
     void** proxyAddress = nullptr;
-    WindhawkUtils::SYMBOL_HOOK symbolHook = {
+    WindhawkUtils::SYMBOL_HOOK explorerFrameDllHooks[] = {
         {
-            L"public: virtual long "
-            SSTDCALL
-            L" CNscTree::SetStateImageList(struct _IMAGELIST *)"
-        },
-        &proxyAddress,
-        nullptr,
-        true
+            {
+                L"public: virtual long "
+                SSTDCALL
+                L" CNscTree::SetStateImageList(struct _IMAGELIST *)"
+            },
+            &proxyAddress,
+            nullptr,
+            true
+        }
     };
 
-    if (!WindhawkUtils::HookSymbols(g_hExplorerFrame, &symbolHook, 1))
+    if (!WindhawkUtils::HookSymbols(g_hExplorerFrame, explorerFrameDllHooks, ARRAYSIZE(explorerFrameDllHooks)))
     {
         Wh_Log(L"[Explorer TreeItem Tweaker] failed to resolve CNscTree::SetStateImageList");
         return true;
