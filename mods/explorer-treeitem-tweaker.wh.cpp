@@ -445,7 +445,6 @@ Thanks to [valinet](https://github.com/valinet) for the Hide Pin Button function
 #include <gdiplus.h>
 #include <algorithm>
 #include <vector>
-#include <string>
 #include <utility>
 
 #ifndef TMT_TEXTCOLOR
@@ -462,26 +461,6 @@ using namespace Gdiplus;
 #define SSTDCALL L"__stdcall"
 #endif
 
-struct CMWF_SYMBOL_HOOK
-{
-    std::vector<std::wstring> symbols;
-    void** pOriginalFunction;
-    void* hookFunction;
-    bool optional;
-
-    CMWF_SYMBOL_HOOK(std::vector<std::wstring> symbols,
-                     void** pOriginalFunction,
-                     void* hookFunction,
-                     bool optional = false)
-        : symbols(std::move(symbols)),
-          pOriginalFunction(pOriginalFunction),
-          hookFunction(hookFunction),
-          optional(optional)
-    {
-    }
-};
-
-static std::vector<void*> g_SymbolHookedFunctions;
 static HMODULE g_hExplorerFrame = nullptr;
 
 struct ExplorerState
@@ -1142,13 +1121,9 @@ static bool HookExplorerFrameSymbols()
         return true;
     }
 
-    if (Wh_SetFunctionHook(proxyAddress,
-                           (void*)CNscTree_SetStateImageList_hook,
-                           (void**)&CNscTree_SetStateImageList_orig))
-    {
-        g_SymbolHookedFunctions.push_back(proxyAddress);
-    }
-    else
+    if (!Wh_SetFunctionHook(proxyAddress,
+                            (void*)CNscTree_SetStateImageList_hook,
+                            (void**)&CNscTree_SetStateImageList_orig))
     {
         Wh_Log(L"[Explorer TreeItem Tweaker] failed to hook CNscTree::SetStateImageList");
     }
@@ -2932,10 +2907,6 @@ void Wh_ModUninit()
     }
 
     g_WorkerThreadId = 0;
-
-    for (void* function : g_SymbolHookedFunctions)
-        Wh_RemoveFunctionHook(function);
-    g_SymbolHookedFunctions.clear();
 
     if (g_hExplorerFrame)
     {
